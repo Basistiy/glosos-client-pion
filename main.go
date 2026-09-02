@@ -204,11 +204,15 @@ func main() {
 				}
 			}
 
-			if len(others) > 0 {
-				log.Printf("[Signaling] %d other peer(s) online (type /call <number> to connect):\n  %s",
-					len(others), strings.Join(others, "\n  "))
-			} else {
-				log.Printf("[Signaling] No other devices online. Log into the Web client to see it here.")
+			// Only print online users in console when not in an active WebRTC call to avoid cluttering chat
+			dcm := webrtcMgr.DataChannelManager()
+			if dcm == nil || !dcm.IsOpen() {
+				if len(others) > 0 {
+					log.Printf("[Signaling] %d other peer(s) online (type /call <number> to connect):\n  %s",
+						len(others), strings.Join(others, "\n  "))
+				} else {
+					log.Printf("[Signaling] No other devices online.")
+				}
 			}
 		},
 		OnIncomingCall: func(payload signaling.IncomingCallPayload) {
