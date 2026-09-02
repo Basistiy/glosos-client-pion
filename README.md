@@ -59,9 +59,11 @@ export GLOSOS_PASSWORD=secretpassword
 | `-server` | | `GLOSOS_SERVER` | `http://localhost:5001` | URL of the Glosos signaling and backend API |
 | `-login` | `-u` | `GLOSOS_LOGIN` | | User login (username or email) |
 | `-password` | `-p` | `GLOSOS_PASSWORD` | | Account password (prompted if omitted) |
+| `-auto-connect` | | `GLOSOS_AUTO_CONNECT` | `false` | Automatically connect to online peer/device |
+| `-target` | `-auto-connect-target` | `GLOSOS_AUTO_CONNECT_TARGET` | `""` | Target peer keyword to auto-connect (e.g. `mac-server`) |
 | `-auto-accept` | | | `true` | Automatically accept incoming WebRTC calls |
 | `-turn` | | | `false` | Enable TURN relay fallback using ephemeral credentials |
-| `-call` | | | `""` | Socket ID of target peer to call immediately on launch |
+| `-call` | | | `""` | Socket ID or peer index to call immediately on launch |
 | `-client-type` | | | `pion-cli` | Client type identifier sent in signaling handshake |
 | `-device-model`| | | `Go/Pion Terminal` | Device model description |
 
@@ -71,8 +73,9 @@ export GLOSOS_PASSWORD=secretpassword
 
 While the client is running, you can use the following interactive commands:
 
-- `/users` — List active devices and socket IDs connected under your user account.
-- `/call <socketId>` — Initiate a WebRTC connection to a specific peer.
+- `/users` — List active devices and socket IDs connected under your user account with index numbers `[1]`, `[2]`.
+- `/call <number|keyword|socketId>` — Initiate a WebRTC connection (e.g. `/call 1` or `/call mac`).
+- `/autoconnect [on|off|<target>]` — Enable/disable or set target for automatic connection.
 - `/hangup` — Close the active WebRTC connection.
 - `/clear` — Send a `/clear` reset command to the remote peer.
 - `/help` — Display available commands.

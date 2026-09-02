@@ -12,14 +12,16 @@ import (
 
 // Config holds runtime options for the Pion client.
 type Config struct {
-	ServerURL   string
-	Login       string
-	Password    string
-	UseTurn     bool
-	AutoAccept  bool
-	CallTarget  string
-	ClientType  string
-	DeviceModel string
+	ServerURL         string
+	Login             string
+	Password          string
+	UseTurn           bool
+	AutoAccept        bool
+	AutoConnect       bool
+	AutoConnectTarget string
+	CallTarget        string
+	ClientType        string
+	DeviceModel       string
 }
 
 // ParseFlags parses command-line flags and environment variables.
@@ -33,7 +35,10 @@ func ParseFlags() (*Config, error) {
 	flag.StringVar(&cfg.Password, "p", getEnvDefault("GLOSOS_PASSWORD", ""), "Account password (shorthand)")
 	flag.BoolVar(&cfg.UseTurn, "turn", false, "Use TURN relay servers for WebRTC")
 	flag.BoolVar(&cfg.AutoAccept, "auto-accept", true, "Automatically accept incoming calls from other peers/tabs")
-	flag.StringVar(&cfg.CallTarget, "call", "", "Socket ID of peer to call immediately upon connection")
+	flag.BoolVar(&cfg.AutoConnect, "auto-connect", getEnvBoolDefault("GLOSOS_AUTO_CONNECT", false), "Automatically connect to online peer (or target)")
+	flag.StringVar(&cfg.AutoConnectTarget, "auto-connect-target", getEnvDefault("GLOSOS_AUTO_CONNECT_TARGET", ""), "Target keyword/identifier for auto-connection (e.g. 'mac-server' or 'web')")
+	flag.StringVar(&cfg.AutoConnectTarget, "target", getEnvDefault("GLOSOS_AUTO_CONNECT_TARGET", ""), "Target keyword/identifier for auto-connection (shorthand)")
+	flag.StringVar(&cfg.CallTarget, "call", "", "Socket ID or peer index to call immediately upon connection")
 	flag.StringVar(&cfg.ClientType, "client-type", "pion-cli", "Client type identifier for signaling")
 	flag.StringVar(&cfg.DeviceModel, "device-model", "Go/Pion Terminal", "Device model identifier for signaling")
 
@@ -75,6 +80,14 @@ func ParseFlags() (*Config, error) {
 func getEnvDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func getEnvBoolDefault(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		v = strings.ToLower(strings.TrimSpace(v))
+		return v == "true" || v == "1" || v == "yes"
 	}
 	return def
 }

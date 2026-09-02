@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/Basistiy/glosos-client-pion/internal/auth"
 	"github.com/Basistiy/glosos-client-pion/internal/config"
@@ -30,6 +31,10 @@ func main() {
 	fmt.Printf("  User Login       : %s\n", cfg.Login)
 	fmt.Printf("  TURN Relay       : %v\n", cfg.UseTurn)
 	fmt.Printf("  Auto-Accept Calls: %v\n", cfg.AutoAccept)
+	fmt.Printf("  Auto-Connect     : %v\n", cfg.AutoConnect || cfg.CallTarget != "" || cfg.AutoConnectTarget != "")
+	if cfg.AutoConnectTarget != "" {
+		fmt.Printf("  Target Keyword   : %s\n", cfg.AutoConnectTarget)
+	}
 	fmt.Println("======================================================")
 
 	// 1. Authenticate with Glosos Backend
@@ -71,6 +76,10 @@ func main() {
 		webrtcMgr       *webrtc.Manager
 		onlineUsersMu   sync.RWMutex
 		onlineUsers     []signaling.OnlineUser
+
+		autoConnectMu      sync.Mutex
+		autoConnectEnabled = cfg.AutoConnect || cfg.CallTarget != "" || cfg.AutoConnectTarget != ""
+		autoConnectTimer   *time.Timer
 	)
 
 	// Helper to resolve peer target from input (number index, device keyword, or socketId)
@@ -114,12 +123,80 @@ func main() {
 		for _, u := range others {
 			if strings.Contains(strings.ToLower(u.DeviceModel), lowerInput) ||
 				strings.Contains(strings.ToLower(u.ClientType), lowerInput) ||
+				strings.Contains(strings.ToLower(u.Username), lowerInput) ||
 				strings.HasPrefix(strings.ToLower(u.SocketID), lowerInput) {
 				return &u
 			}
 		}
 
 		return nil
+	}
+
+	// Helper to trigger automatic connection / reconnection
+	triggerAutoConnect := func() {
+		autoConnectMu.Lock()
+		defer autoConnectMu.Unlock()
+
+		if !autoConnectEnabled {
+			return
+		}
+
+		if webrtcMgr != nil && webrtcMgr.IsActive() {
+			return
+		}
+
+		if autoConnectTimer != nil {
+			autoConnectTimer.Stop()
+		}
+
+		// 500ms debounce to allow online-users / sockets to stabilize
+		autoConnectTimer = time.AfterFunc(500*time.Millisecond, func() {
+			if webrtcMgr == nil || webrtcMgr.IsActive() {
+				return
+			}
+
+			var candidate *signaling.OnlineUser
+			if cfg.AutoConnectTarget != "" {
+				candidate = resolveTargetPeer(cfg.AutoConnectTarget)
+			} else if cfg.CallTarget != "" {
+				candidate = resolveTargetPeer(cfg.CallTarget)
+			} else {
+				// Pick first online peer
+				onlineUsersMu.RLock()
+				myID := ""
+				if signalingClient != nil {
+					myID = signalingClient.SocketID()
+				}
+				for _, u := range onlineUsers {
+					if u.SocketID != myID {
+						uCopy := u
+						candidate = &uCopy
+						break
+					}
+				}
+				onlineUsersMu.RUnlock()
+			}
+
+			if candidate != nil && signalingClient != nil {
+				targetID := candidate.SocketID
+				targetName := candidate.Username
+				if candidate.DeviceModel != "" {
+					targetName += " (" + candidate.DeviceModel + ")"
+				} else if candidate.ClientType != "" {
+					targetName += " (" + candidate.ClientType + ")"
+				}
+
+				log.Printf("[Auto-Connect] Automatically connecting to %s [Socket: %s] ...", targetName, targetID)
+				offer, err := webrtcMgr.CreateOfferForCall(targetID, targetName)
+				if err != nil {
+					log.Printf("[Auto-Connect] Error creating offer: %v", err)
+					return
+				}
+				if err := signalingClient.CallUser(targetID, offer, cfg.UseTurn); err != nil {
+					log.Printf("[Auto-Connect] Error sending call: %v", err)
+				}
+			}
+		})
 	}
 
 	// 4. Setup WebRTC Manager Callbacks
@@ -134,6 +211,8 @@ func main() {
 		OnConnectionState: func(state pionwebrtc.PeerConnectionState) {
 			if state == pionwebrtc.PeerConnectionStateConnected {
 				fmt.Printf("\n\033[1;32m[WebRTC Connected]\033[0m P2P Connection established with peer!\n> ")
+			} else if state == pionwebrtc.PeerConnectionStateFailed || state == pionwebrtc.PeerConnectionStateClosed || state == pionwebrtc.PeerConnectionStateDisconnected {
+				triggerAutoConnect()
 			}
 		},
 		OnDataChannelOpen: func() {
@@ -141,6 +220,7 @@ func main() {
 		},
 		OnDataChannelClose: func() {
 			fmt.Printf("\n\033[1;31m[DataChannel Closed]\033[0m WebRTC session ended.\n> ")
+			triggerAutoConnect()
 		},
 		OnDataChannelMsg: webrtc.DefaultConsoleMessageFormatter,
 	}
@@ -152,30 +232,7 @@ func main() {
 	signalingHandlers := signaling.Handlers{
 		OnConnected: func(socketID string) {
 			log.Printf("[Signaling] Ready to receive and initiate calls.")
-			if cfg.CallTarget != "" {
-				go func() {
-					target := resolveTargetPeer(cfg.CallTarget)
-					targetID := cfg.CallTarget
-					targetName := "Peer"
-					if target != nil {
-						targetID = target.SocketID
-						targetName = target.Username
-						if target.DeviceModel != "" {
-							targetName += " (" + target.DeviceModel + ")"
-						}
-					}
-
-					log.Printf("[Call] Calling target %s (%s) immediately...", targetName, targetID)
-					offer, err := webrtcMgr.CreateOfferForCall(targetID, targetName)
-					if err != nil {
-						log.Printf("[Call] Failed to create offer: %v", err)
-						return
-					}
-					if err := signalingClient.CallUser(targetID, offer, cfg.UseTurn); err != nil {
-						log.Printf("[Call] Failed to send call-user offer: %v", err)
-					}
-				}()
-			}
+			triggerAutoConnect()
 		},
 		OnOnlineUsers: func(users []signaling.OnlineUser) {
 			onlineUsersMu.Lock()
@@ -205,8 +262,7 @@ func main() {
 			}
 
 			// Only print online users in console when not in an active WebRTC call to avoid cluttering chat
-			dcm := webrtcMgr.DataChannelManager()
-			if dcm == nil || !dcm.IsOpen() {
+			if !webrtcMgr.IsActive() {
 				if len(others) > 0 {
 					log.Printf("[Signaling] %d other peer(s) online (type /call <number> to connect):\n  %s",
 						len(others), strings.Join(others, "\n  "))
@@ -214,6 +270,9 @@ func main() {
 					log.Printf("[Signaling] No other devices online.")
 				}
 			}
+
+			// Trigger auto-connection if enabled
+			triggerAutoConnect()
 		},
 		OnIncomingCall: func(payload signaling.IncomingCallPayload) {
 			log.Printf("[Signaling] Incoming call from \033[1;36m%s\033[0m (Socket ID: %s, TURN: %v)",
@@ -249,10 +308,12 @@ func main() {
 		OnHangUp: func(payload signaling.HangUpPayload) {
 			log.Printf("[Signaling] Peer hung up the connection.")
 			webrtcMgr.Close()
+			triggerAutoConnect()
 		},
 		OnCallFailed: func(payload signaling.CallFailedPayload) {
 			log.Printf("[Signaling] Call failed to socket %s: %s", payload.TargetSocketID, payload.Reason)
 			webrtcMgr.Close()
+			triggerAutoConnect()
 		},
 	}
 
@@ -341,6 +402,36 @@ func main() {
 				fmt.Println("----------------------------")
 				onlineUsersMu.RUnlock()
 
+			case "autoconnect":
+				if len(parts) > 1 {
+					arg := strings.ToLower(parts[1])
+					autoConnectMu.Lock()
+					if arg == "on" || arg == "true" || arg == "1" {
+						autoConnectEnabled = true
+						fmt.Println("[Auto-Connect] Enabled.")
+					} else if arg == "off" || arg == "false" || arg == "0" {
+						autoConnectEnabled = false
+						fmt.Println("[Auto-Connect] Disabled.")
+					} else {
+						cfg.AutoConnectTarget = parts[1]
+						autoConnectEnabled = true
+						fmt.Printf("[Auto-Connect] Enabled with target '%s'.\n", parts[1])
+					}
+					autoConnectMu.Unlock()
+					triggerAutoConnect()
+				} else {
+					autoConnectMu.Lock()
+					status := "disabled"
+					if autoConnectEnabled {
+						status = "enabled"
+						if cfg.AutoConnectTarget != "" {
+							status += fmt.Sprintf(" (target: %s)", cfg.AutoConnectTarget)
+						}
+					}
+					autoConnectMu.Unlock()
+					fmt.Printf("[Auto-Connect] Current status: %s\n", status)
+				}
+
 			case "call":
 				if len(parts) < 2 {
 					fmt.Println("Usage: /call <number|keyword|socketId> (e.g. /call 1)")
@@ -376,10 +467,14 @@ func main() {
 				}
 
 			case "hangup":
+				autoConnectMu.Lock()
+				autoConnectEnabled = false
+				autoConnectMu.Unlock()
+
 				targetID := webrtcMgr.TargetSocketID()
 				if targetID != "" {
 					_ = signalingClient.HangUp(targetID)
-					log.Printf("[Call] Hung up call to socket %s.", targetID)
+					log.Printf("[Call] Hung up call to socket %s (Auto-connect paused).", targetID)
 				}
 				webrtcMgr.Close()
 
@@ -430,6 +525,7 @@ func printHelp() {
 	fmt.Println("\nAvailable CLI Commands:")
 	fmt.Println("  /users              - List active online devices/peers with numbers [1], [2]...")
 	fmt.Println("  /call <1|2|socket>  - Initiate WebRTC connection (e.g. /call 1)")
+	fmt.Println("  /autoconnect [on|off] - Toggle or configure automatic connection")
 	fmt.Println("  /hangup             - End the active connection")
 	fmt.Println("  /clear              - Send /clear reset command")
 	fmt.Println("  /help               - Show this help message")

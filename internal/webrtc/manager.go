@@ -90,6 +90,26 @@ func (m *Manager) DataChannelManager() *DataChannelManager {
 	return m.dataChannelMgr
 }
 
+// IsActive returns true if a peer connection is currently active (connecting or connected).
+func (m *Manager) IsActive() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.pc == nil {
+		return false
+	}
+	state := m.pc.ConnectionState()
+	return state == webrtc.PeerConnectionStateNew ||
+		state == webrtc.PeerConnectionStateConnecting ||
+		state == webrtc.PeerConnectionStateConnected
+}
+
+// IsConnected returns true if DataChannel is open.
+func (m *Manager) IsConnected() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.dataChannelMgr != nil && m.dataChannelMgr.IsOpen()
+}
+
 // buildRTCConfiguration constructs the Pion RTCConfiguration with STUN and TURN servers.
 func (m *Manager) buildRTCConfiguration() webrtc.Configuration {
 	iceServers := []webrtc.ICEServer{
