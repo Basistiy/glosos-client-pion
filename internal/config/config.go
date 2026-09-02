@@ -1,0 +1,80 @@
+package config
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"strings"
+	"syscall"
+
+	"golang.org/x/term"
+)
+
+// Config holds runtime options for the Pion client.
+type Config struct {
+	ServerURL   string
+	Login       string
+	Password    string
+	UseTurn     bool
+	AutoAccept  bool
+	CallTarget  string
+	ClientType  string
+	DeviceModel string
+}
+
+// ParseFlags parses command-line flags and environment variables.
+func ParseFlags() (*Config, error) {
+	cfg := &Config{}
+
+	flag.StringVar(&cfg.ServerURL, "server", getEnvDefault("GLOSOS_SERVER", "http://localhost:5001"), "Signaling & API server URL")
+	flag.StringVar(&cfg.Login, "login", getEnvDefault("GLOSOS_LOGIN", ""), "Login identifier (username or email)")
+	flag.StringVar(&cfg.Login, "u", getEnvDefault("GLOSOS_LOGIN", ""), "Login identifier (shorthand)")
+	flag.StringVar(&cfg.Password, "password", getEnvDefault("GLOSOS_PASSWORD", ""), "Account password")
+	flag.StringVar(&cfg.Password, "p", getEnvDefault("GLOSOS_PASSWORD", ""), "Account password (shorthand)")
+	flag.BoolVar(&cfg.UseTurn, "turn", false, "Use TURN relay servers for WebRTC")
+	flag.BoolVar(&cfg.AutoAccept, "auto-accept", true, "Automatically accept incoming calls from other peers/tabs")
+	flag.StringVar(&cfg.CallTarget, "call", "", "Socket ID of peer to call immediately upon connection")
+	flag.StringVar(&cfg.ClientType, "client-type", "pion-cli", "Client type identifier for signaling")
+	flag.StringVar(&cfg.DeviceModel, "device-model", "Go/Pion Terminal", "Device model identifier for signaling")
+
+	flag.Parse()
+
+	// Prompt for login if not supplied
+	if strings.TrimSpace(cfg.Login) == "" {
+		fmt.Print("Enter login (email or username): ")
+		var loginInput string
+		_, err := fmt.Scanln(&loginInput)
+		if err != nil && err.Error() != "unexpected newline" {
+			return nil, fmt.Errorf("failed to read login: %w", err)
+		}
+		cfg.Login = strings.TrimSpace(loginInput)
+	}
+
+	if cfg.Login == "" {
+		return nil, fmt.Errorf("login identifier cannot be empty")
+	}
+
+	// Prompt for password if not supplied
+	if strings.TrimSpace(cfg.Password) == "" {
+		fmt.Printf("Enter password for %s: ", cfg.Login)
+		bytePassword, err := term.ReadPassword(int(syscall.Stdin))
+		fmt.Println()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read password: %w", err)
+		}
+		cfg.Password = strings.TrimSpace(string(bytePassword))
+	}
+
+	if cfg.Password == "" {
+		return nil, fmt.Errorf("password cannot be empty")
+	}
+
+	return cfg, nil
+}
+
+func getEnvDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
