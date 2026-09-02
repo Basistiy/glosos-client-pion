@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Basistiy/glosos-client-pion/internal/audio"
 	"github.com/Basistiy/glosos-client-pion/internal/auth"
 	"github.com/Basistiy/glosos-client-pion/internal/config"
 	"github.com/Basistiy/glosos-client-pion/internal/signaling"
@@ -29,6 +30,10 @@ func main() {
 	fmt.Println("  Glosos Pion WebRTC Headless Client")
 	fmt.Printf("  Signaling Server : %s\n", cfg.ServerURL)
 	fmt.Printf("  User Login       : %s\n", cfg.Login)
+	fmt.Printf("  Voice Audio      : %v (Full-Duplex Opus 48kHz)\n", cfg.Voice)
+	if cfg.AudioTestTone {
+		fmt.Printf("  Audio Input Mode : Synthetic 440Hz Test Tone\n")
+	}
 	fmt.Printf("  TURN Relay       : %v\n", cfg.UseTurn)
 	fmt.Printf("  Auto-Accept Calls: %v\n", cfg.AutoAccept)
 	fmt.Printf("  Auto-Connect     : %v\n", cfg.AutoConnect || cfg.CallTarget != "" || cfg.AutoConnectTarget != "")
@@ -74,6 +79,7 @@ func main() {
 	var (
 		signalingClient *signaling.Client
 		webrtcMgr       *webrtc.Manager
+		audioPipeline   *audio.Pipeline
 		onlineUsersMu   sync.RWMutex
 		onlineUsers     []signaling.OnlineUser
 
@@ -81,6 +87,27 @@ func main() {
 		autoConnectEnabled = cfg.AutoConnect || cfg.CallTarget != "" || cfg.AutoConnectTarget != ""
 		autoConnectTimer   *time.Timer
 	)
+
+	// 4. Initialize Full-Duplex Audio Pipeline
+	if cfg.Voice {
+		pipeline, err := audio.NewPipeline(audio.Config{
+			Enabled:          true,
+			InputDeviceName:  cfg.InputDevice,
+			OutputDeviceName: cfg.OutputDevice,
+			UseTestTone:      cfg.AudioTestTone,
+		})
+		if err != nil {
+			log.Printf("[Audio] Warning: Failed to initialize audio pipeline: %v. Continuing in text-only mode.", err)
+		} else {
+			audioPipeline = pipeline
+			if err := audioPipeline.Start(); err != nil {
+				log.Printf("[Audio] Warning: Failed to start audio devices: %v", err)
+			} else {
+				log.Println("[Audio] Full-duplex voice pipeline started successfully.")
+			}
+			defer audioPipeline.Close()
+		}
+	}
 
 	// Helper to resolve peer target from input (number index, device keyword, or socketId)
 	resolveTargetPeer := func(input string) *signaling.OnlineUser {
@@ -199,7 +226,7 @@ func main() {
 		})
 	}
 
-	// 4. Setup WebRTC Manager Callbacks
+	// 5. Setup WebRTC Manager Callbacks
 	webrtcCallbacks := webrtc.Callbacks{
 		OnLocalICECandidate: func(targetSocketID string, candidate webrtc.ICECandidateJSON) {
 			if signalingClient != nil {
@@ -223,12 +250,32 @@ func main() {
 			triggerAutoConnect()
 		},
 		OnDataChannelMsg: webrtc.DefaultConsoleMessageFormatter,
+		OnRemoteAudioFrame: func(opusData []byte) {
+			if audioPipeline != nil {
+				audioPipeline.PushRemoteOpusFrame(opusData)
+			}
+		},
+		OnAudioTrackOpen: func() {
+			fmt.Printf("\n\033[1;32m[Audio Track Open]\033[0m Full-duplex voice stream active with remote peer.\n> ")
+		},
+		OnAudioTrackClose: func() {
+			fmt.Printf("\n\033[1;33m[Audio Track Closed]\033[0m Remote audio track closed.\n> ")
+		},
 	}
 
-	webrtcMgr = webrtc.NewManager(webrtcCallbacks, turnCreds, cfg.UseTurn)
+	webrtcMgr = webrtc.NewManager(webrtcCallbacks, turnCreds, cfg.UseTurn, cfg.Voice)
 	defer webrtcMgr.Close()
 
-	// 5. Setup Signaling Handlers
+	// Link Audio Pipeline outbound frames to WebRTC local audio track
+	if audioPipeline != nil {
+		audioPipeline.SetLocalOpusHandler(func(opusFrame []byte) {
+			if webrtcMgr != nil && webrtcMgr.IsActive() {
+				_ = webrtcMgr.SendAudioSample(opusFrame, time.Duration(audio.FrameDurationMs)*time.Millisecond)
+			}
+		})
+	}
+
+	// 6. Setup Signaling Handlers
 	signalingHandlers := signaling.Handlers{
 		OnConnected: func(socketID string) {
 			log.Printf("[Signaling] Ready to receive and initiate calls.")
@@ -317,7 +364,7 @@ func main() {
 		},
 	}
 
-	// 6. Connect Signaling Client
+	// 7. Connect Signaling Client
 	signalingClient = signaling.NewClient(
 		cfg.ServerURL,
 		tokenMgr.GetToken(),
@@ -336,7 +383,7 @@ func main() {
 	}
 	defer signalingClient.Close()
 
-	// 7. Handle SIGINT / SIGTERM for Graceful Exit
+	// 8. Handle SIGINT / SIGTERM for Graceful Exit
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -345,13 +392,16 @@ func main() {
 		if webrtcMgr.TargetSocketID() != "" {
 			_ = signalingClient.HangUp(webrtcMgr.TargetSocketID())
 		}
+		if audioPipeline != nil {
+			audioPipeline.Close()
+		}
 		webrtcMgr.Close()
 		signalingClient.Close()
 		tokenMgr.Stop()
 		os.Exit(0)
 	}()
 
-	// 8. Interactive CLI REPL Loop
+	// 9. Interactive CLI REPL Loop
 	printHelp()
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Print("> ")
@@ -466,6 +516,80 @@ func main() {
 					}
 				}
 
+			case "mute":
+				if audioPipeline != nil {
+					audioPipeline.SetMuted(true)
+					fmt.Println("[Audio] \033[1;31m[MUTED]\033[0m Microphone audio transmission paused.")
+				} else {
+					fmt.Println("[Audio] Voice is disabled.")
+				}
+
+			case "unmute":
+				if audioPipeline != nil {
+					audioPipeline.SetMuted(false)
+					fmt.Println("[Audio] \033[1;32m[UNMUTED]\033[0m Microphone audio transmission active.")
+				} else {
+					fmt.Println("[Audio] Voice is disabled.")
+				}
+
+			case "deafen":
+				if audioPipeline != nil {
+					audioPipeline.SetDeafened(true)
+					fmt.Println("[Audio] \033[1;31m[DEAFENED]\033[0m Speaker audio output muted.")
+				} else {
+					fmt.Println("[Audio] Voice is disabled.")
+				}
+
+			case "undeafen":
+				if audioPipeline != nil {
+					audioPipeline.SetDeafened(false)
+					fmt.Println("[Audio] \033[1;32m[UNDEAFENED]\033[0m Speaker audio output restored.")
+				} else {
+					fmt.Println("[Audio] Voice is disabled.")
+				}
+
+			case "audio":
+				if audioPipeline != nil {
+					fmt.Println("\n--- Audio Pipeline Status ---")
+					micStatus := "\033[1;32mActive (Streaming)\033[0m"
+					if audioPipeline.IsMuted() {
+						micStatus = "\033[1;31mMuted\033[0m"
+					}
+					spkStatus := "\033[1;32mActive (Playing)\033[0m"
+					if audioPipeline.IsDeafened() {
+						spkStatus = "\033[1;31mDeafened\033[0m"
+					}
+					fmt.Printf("  Microphone : %s\n", micStatus)
+					fmt.Printf("  Speaker    : %s\n", spkStatus)
+					fmt.Printf("  Codec      : Opus 48,000 Hz, Mono, 20ms frames\n")
+					if cfg.AudioTestTone {
+						fmt.Printf("  Mode       : Synthetic 440Hz Test Tone\n")
+					}
+					fmt.Println("-----------------------------")
+				} else {
+					fmt.Println("[Audio] Voice is disabled. Launch with default or -voice=true to enable.")
+				}
+
+			case "devices":
+				if audioPipeline != nil {
+					devs, err := audioPipeline.ListDevices()
+					if err != nil {
+						fmt.Printf("[Audio] Failed to list devices: %v\n", err)
+					} else {
+						fmt.Println("\n--- Audio Devices ---")
+						for _, d := range devs {
+							def := ""
+							if d.IsDefault {
+								def = " \033[1;32m(Default)\033[0m"
+							}
+							fmt.Printf("  [%s] %s%s\n", strings.ToUpper(d.Type), d.Name, def)
+						}
+						fmt.Println("---------------------")
+					}
+				} else {
+					fmt.Println("[Audio] Audio pipeline is not initialized.")
+				}
+
 			case "hangup":
 				autoConnectMu.Lock()
 				autoConnectEnabled = false
@@ -493,6 +617,9 @@ func main() {
 				fmt.Println("Exiting...")
 				if targetID := webrtcMgr.TargetSocketID(); targetID != "" {
 					_ = signalingClient.HangUp(targetID)
+				}
+				if audioPipeline != nil {
+					audioPipeline.Close()
 				}
 				webrtcMgr.Close()
 				signalingClient.Close()
@@ -526,6 +653,10 @@ func printHelp() {
 	fmt.Println("  /users              - List active online devices/peers with numbers [1], [2]...")
 	fmt.Println("  /call <1|2|socket>  - Initiate WebRTC connection (e.g. /call 1)")
 	fmt.Println("  /autoconnect [on|off] - Toggle or configure automatic connection")
+	fmt.Println("  /mute / /unmute     - Mute or unmute microphone audio sending")
+	fmt.Println("  /deafen / /undeafen - Mute or unmute speaker audio playback")
+	fmt.Println("  /audio              - Show active voice/audio pipeline status")
+	fmt.Println("  /devices            - List available audio input/output devices")
 	fmt.Println("  /hangup             - End the active connection")
 	fmt.Println("  /clear              - Send /clear reset command")
 	fmt.Println("  /help               - Show this help message")

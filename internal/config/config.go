@@ -22,6 +22,10 @@ type Config struct {
 	CallTarget        string
 	ClientType        string
 	DeviceModel       string
+	Voice             bool
+	InputDevice       string
+	OutputDevice      string
+	AudioTestTone     bool
 }
 
 // ParseFlags parses command-line flags and environment variables.
@@ -41,6 +45,13 @@ func ParseFlags() (*Config, error) {
 	flag.StringVar(&cfg.CallTarget, "call", "", "Socket ID or peer index to call immediately upon connection")
 	flag.StringVar(&cfg.ClientType, "client-type", "pion-cli", "Client type identifier for signaling")
 	flag.StringVar(&cfg.DeviceModel, "device-model", "Go/Pion Terminal", "Device model identifier for signaling")
+
+	// Audio / Voice Flags
+	flag.BoolVar(&cfg.Voice, "voice", getEnvBoolDefault("GLOSOS_VOICE", true), "Enable full-duplex WebRTC voice transfer")
+	flag.BoolVar(&cfg.Voice, "audio", getEnvBoolDefault("GLOSOS_VOICE", true), "Enable full-duplex WebRTC voice transfer (alias)")
+	flag.StringVar(&cfg.InputDevice, "input-device", getEnvDefault("GLOSOS_INPUT_DEVICE", ""), "Audio capture/microphone device name")
+	flag.StringVar(&cfg.OutputDevice, "output-device", getEnvDefault("GLOSOS_OUTPUT_DEVICE", ""), "Audio playback/speaker device name")
+	flag.BoolVar(&cfg.AudioTestTone, "audio-test-tone", false, "Generate 440Hz test sine tone instead of microphone")
 
 	flag.Parse()
 

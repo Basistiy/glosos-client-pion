@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/Basistiy/glosos-client-pion/internal/auth"
 	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
 )
 
 // SessionDescriptionJSON matches the standard WebRTC RTCSessionDescriptionInit structure.
@@ -32,29 +34,36 @@ type Callbacks struct {
 	OnDataChannelOpen   func()
 	OnDataChannelClose  func()
 	OnDataChannelMsg    MessageHandler
+	OnRemoteAudioFrame  func(opusData []byte)
+	OnAudioTrackOpen    func()
+	OnAudioTrackClose   func()
 }
 
 // Manager manages the lifecycle of a Pion WebRTC PeerConnection.
 type Manager struct {
-	mu                 sync.RWMutex
-	pc                 *webrtc.PeerConnection
-	dataChannelMgr     *DataChannelManager
-	targetSocketID     string
-	targetUsername     string
-	callbacks          Callbacks
-	turnCreds          *auth.TurnCredentialsResponse
-	useTurn            bool
-	pendingCandidates  []webrtc.ICECandidateInit
-	isRemoteDescSet    bool
-	api                *webrtc.API
+	mu                sync.RWMutex
+	pc                *webrtc.PeerConnection
+	dataChannelMgr    *DataChannelManager
+	localAudioTrack   *webrtc.TrackLocalStaticSample
+	rtpSender         *webrtc.RTPSender
+	targetSocketID    string
+	targetUsername    string
+	callbacks         Callbacks
+	turnCreds         *auth.TurnCredentialsResponse
+	useTurn           bool
+	audioEnabled      bool
+	pendingCandidates []webrtc.ICECandidateInit
+	isRemoteDescSet   bool
+	api               *webrtc.API
 }
 
 // NewManager creates a new WebRTC Manager instance.
-func NewManager(callbacks Callbacks, turnCreds *auth.TurnCredentialsResponse, useTurn bool) *Manager {
+func NewManager(callbacks Callbacks, turnCreds *auth.TurnCredentialsResponse, useTurn bool, audioEnabled bool) *Manager {
 	return &Manager{
-		callbacks: callbacks,
-		turnCreds: turnCreds,
-		useTurn:   useTurn,
+		callbacks:    callbacks,
+		turnCreds:    turnCreds,
+		useTurn:      useTurn,
+		audioEnabled: audioEnabled,
 	}
 }
 
@@ -155,8 +164,16 @@ func (m *Manager) initPeerConnection(targetSocketID, targetUsername string) erro
 	m.isRemoteDescSet = false
 
 	config := m.buildRTCConfiguration()
+
+	// Register codecs on MediaEngine
+	mediaEngine := &webrtc.MediaEngine{}
+	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
+		m.mu.Unlock()
+		return fmt.Errorf("failed to register default codecs: %w", err)
+	}
+
 	settingEngine := webrtc.SettingEngine{}
-	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
+	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine), webrtc.WithMediaEngine(mediaEngine))
 	m.api = api
 
 	pc, err := api.NewPeerConnection(config)
@@ -166,6 +183,36 @@ func (m *Manager) initPeerConnection(targetSocketID, targetUsername string) erro
 	}
 
 	m.pc = pc
+
+	// Add local audio track if audio is enabled
+	if m.audioEnabled {
+		audioTrack, err := webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+			"audio",
+			"glosos-audio",
+		)
+		if err != nil {
+			log.Printf("[WebRTC] Warning: failed to create local audio track: %v", err)
+		} else {
+			m.localAudioTrack = audioTrack
+			rtpSender, err := pc.AddTrack(audioTrack)
+			if err != nil {
+				log.Printf("[WebRTC] Warning: failed to add local audio track: %v", err)
+			} else {
+				m.rtpSender = rtpSender
+				// Read RTCP feedback packets in background to prevent buffer bloat
+				go func() {
+					rtcpBuf := make([]byte, 1500)
+					for {
+						if _, _, err := rtpSender.Read(rtcpBuf); err != nil {
+							return
+						}
+					}
+				}()
+			}
+		}
+	}
+
 	m.mu.Unlock()
 
 	// Handle ICE Candidates
@@ -187,6 +234,34 @@ func (m *Manager) initPeerConnection(targetSocketID, targetUsername string) erro
 
 		if m.callbacks.OnLocalICECandidate != nil && targetID != "" {
 			m.callbacks.OnLocalICECandidate(targetID, iceJSON)
+		}
+	})
+
+	// Handle Incoming Remote Tracks (Audio)
+	pc.OnTrack(func(remoteTrack *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		log.Printf("[WebRTC] Remote track received: Kind=%s, ID=%s, Codec=%s",
+			remoteTrack.Kind().String(), remoteTrack.ID(), remoteTrack.Codec().MimeType)
+
+		if remoteTrack.Kind() == webrtc.RTPCodecTypeAudio {
+			if m.callbacks.OnAudioTrackOpen != nil {
+				m.callbacks.OnAudioTrackOpen()
+			}
+			go func() {
+				defer func() {
+					if m.callbacks.OnAudioTrackClose != nil {
+						m.callbacks.OnAudioTrackClose()
+					}
+				}()
+				for {
+					packet, _, err := remoteTrack.ReadRTP()
+					if err != nil {
+						return
+					}
+					if m.callbacks.OnRemoteAudioFrame != nil && len(packet.Payload) > 0 {
+						m.callbacks.OnRemoteAudioFrame(packet.Payload)
+					}
+				}
+			}()
 		}
 	})
 
@@ -343,6 +418,22 @@ func (m *Manager) HandleCallAccepted(answererSocketID string, rawAnswer interfac
 	return nil
 }
 
+// SendAudioSample writes an Opus audio packet to the local outbound audio track.
+func (m *Manager) SendAudioSample(opusData []byte, duration time.Duration) error {
+	m.mu.RLock()
+	track := m.localAudioTrack
+	m.mu.RUnlock()
+
+	if track == nil {
+		return errors.New("local audio track not initialized")
+	}
+
+	return track.WriteSample(media.Sample{
+		Data:     opusData,
+		Duration: duration,
+	})
+}
+
 // AddRemoteICECandidate adds a remote ICE candidate, or queues it if the remote description has not been set yet.
 func (m *Manager) AddRemoteICECandidate(rawCandidate interface{}) error {
 	candInit, err := parseICECandidate(rawCandidate)
@@ -389,7 +480,7 @@ func (m *Manager) SendTextMessage(text string) error {
 	return dcm.SendText(text)
 }
 
-// Close tears down the PeerConnection and DataChannel.
+// Close tears down the PeerConnection, DataChannel, and Audio tracks.
 func (m *Manager) Close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -398,6 +489,9 @@ func (m *Manager) Close() {
 		_ = m.dataChannelMgr.Close()
 		m.dataChannelMgr = nil
 	}
+
+	m.localAudioTrack = nil
+	m.rtpSender = nil
 
 	if m.pc != nil {
 		_ = m.pc.Close()
