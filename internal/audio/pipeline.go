@@ -3,8 +3,10 @@ package audio
 import (
 	"fmt"
 	"log"
+	"math"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Pipeline coordinates full-duplex voice capture, Opus encoding, Opus decoding, and audio playback.
@@ -157,3 +159,75 @@ func (p *Pipeline) Close() {
 		p.devMgr.Close()
 	}
 }
+
+// PlayConnectSound plays a cheerful ascending two-tone chime (587Hz D5 -> 880Hz A5) through the speaker
+// indicating that the WebRTC peer connection has been established.
+func (p *Pipeline) PlayConnectSound() {
+	if !p.isRunning.Load() || p.devMgr == nil {
+		return
+	}
+	var pcm []int16
+	pcm = append(pcm, generateTonePCM(587.33, 75*time.Millisecond, 0.35)...)
+	pcm = append(pcm, generateTonePCM(0, 20*time.Millisecond, 0)...) // brief pause
+	pcm = append(pcm, generateTonePCM(880.00, 140*time.Millisecond, 0.35)...)
+	p.devMgr.PushPlaybackPCM(pcm)
+}
+
+// PlayServerReadySound plays a subtle single confirmation tone (784Hz G5, 60ms)
+// indicating that the client has successfully authenticated with the signaling server.
+func (p *Pipeline) PlayServerReadySound() {
+	if !p.isRunning.Load() || p.devMgr == nil {
+		return
+	}
+	pcm := generateTonePCM(783.99, 60*time.Millisecond, 0.25)
+	p.devMgr.PushPlaybackPCM(pcm)
+}
+
+// PlayDisconnectSound plays a gentle descending two-tone cue (784Hz G5 -> 523Hz C5)
+// indicating that the WebRTC session ended.
+func (p *Pipeline) PlayDisconnectSound() {
+	if !p.isRunning.Load() || p.devMgr == nil {
+		return
+	}
+	var pcm []int16
+	pcm = append(pcm, generateTonePCM(783.99, 70*time.Millisecond, 0.30)...)
+	pcm = append(pcm, generateTonePCM(0, 20*time.Millisecond, 0)...) // brief pause
+	pcm = append(pcm, generateTonePCM(523.25, 110*time.Millisecond, 0.30)...)
+	p.devMgr.PushPlaybackPCM(pcm)
+}
+
+// generateTonePCM synthesizes 16-bit 48kHz mono PCM for a given frequency, duration, and volume (0.0 - 1.0)
+// with attack and decay ramps to prevent clicks.
+func generateTonePCM(freq float64, duration time.Duration, volume float64) []int16 {
+	sampleCount := int(float64(SampleRate) * duration.Seconds())
+	if sampleCount <= 0 {
+		return nil
+	}
+	pcm := make([]int16, sampleCount)
+	if freq <= 0 {
+		return pcm // silence
+	}
+
+	maxAmp := 32767.0 * volume
+	if maxAmp > 32767.0 {
+		maxAmp = 32767.0
+	}
+
+	fadeSamples := int(float64(SampleRate) * 0.008) // 8ms fade
+	if fadeSamples*2 > sampleCount {
+		fadeSamples = sampleCount / 2
+	}
+
+	for i := 0; i < sampleCount; i++ {
+		env := 1.0
+		if i < fadeSamples {
+			env = float64(i) / float64(fadeSamples)
+		} else if i > sampleCount-fadeSamples {
+			env = float64(sampleCount-i) / float64(fadeSamples)
+		}
+		angle := 2.0 * math.Pi * freq * float64(i) / float64(SampleRate)
+		pcm[i] = int16(math.Sin(angle) * maxAmp * env)
+	}
+	return pcm
+}
+

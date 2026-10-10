@@ -26,6 +26,8 @@ type Config struct {
 	InputDevice       string
 	OutputDevice      string
 	AudioTestTone     bool
+	Daemon            bool
+	EnableDisplay     bool
 }
 
 // ParseFlags parses command-line flags and environment variables.
@@ -45,6 +47,9 @@ func ParseFlags() (*Config, error) {
 	flag.StringVar(&cfg.CallTarget, "call", "", "Socket ID or peer index to call immediately upon connection")
 	flag.StringVar(&cfg.ClientType, "client-type", "pion-cli", "Client type identifier for signaling")
 	flag.StringVar(&cfg.DeviceModel, "device-model", "Go/Pion Terminal", "Device model identifier for signaling")
+	flag.BoolVar(&cfg.Daemon, "daemon", getEnvBoolDefault("GLOSOS_DAEMON", false), "Run in daemon/background mode (no interactive prompt)")
+	flag.BoolVar(&cfg.Daemon, "headless", getEnvBoolDefault("GLOSOS_DAEMON", false), "Run in headless mode (alias)")
+	flag.BoolVar(&cfg.EnableDisplay, "display", getEnvBoolDefault("GLOSOS_DISPLAY", true), "Enable printing agent responses on device display")
 
 	// Audio / Voice Flags
 	flag.BoolVar(&cfg.Voice, "voice", getEnvBoolDefault("GLOSOS_VOICE", true), "Enable full-duplex WebRTC voice transfer")

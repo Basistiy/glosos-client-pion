@@ -85,6 +85,7 @@ export GLOSOS_PASSWORD=secretpassword
 | `-auto-accept` | | | `true` | Automatically accept incoming WebRTC calls |
 | `-turn` | | | `false` | Enable TURN relay fallback using ephemeral credentials |
 | `-call` | | | `""` | Socket ID or peer index to call immediately on launch |
+| `-display` | | `GLOSOS_DISPLAY` | `true` | Print incoming agent responses on device LCD screen in yellow letters |
 | `-client-type` | | | `pion-cli` | Client type identifier sent in signaling handshake |
 | `-device-model`| | | `Go/Pion Terminal` | Device model description |
 
@@ -100,6 +101,8 @@ While the client is running, you can use the following interactive commands:
 - `/mute` / `/unmute` — Mute or unmute microphone audio transmission.
 - `/deafen` / `/undeafen` — Mute or unmute incoming speaker audio playback.
 - `/audio` — Display current voice pipeline and device status.
+- `/sound` — Play test connection chime through speaker.
+- `/display [text]` — Print test message or custom text on device display with yellow letters.
 - `/devices` — List available audio input/output devices.
 - `/hangup` — Close the active WebRTC connection.
 - `/clear` — Send a `/clear` reset command to the remote peer.

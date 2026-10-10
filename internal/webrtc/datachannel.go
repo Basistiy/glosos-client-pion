@@ -93,21 +93,34 @@ func (d *DataChannelManager) setupEvents() {
 
 		// Try parsing JSON structure (e.g. {"type":"transcription","text":"..."} or {"type":"agent","text":"..."})
 		var parsed struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+			Type    string `json:"type"`
+			Role    string `json:"role"`
+			Text    string `json:"text"`
+			Content string `json:"content"`
+			Message string `json:"message"`
 		}
 
-		if err := json.Unmarshal(msg.Data, &parsed); err == nil && parsed.Text != "" {
-			if parsed.Type == "transcription" {
-				if d.onMessage != nil {
-					d.onMessage("me (transcription)", parsed.Text, msg.Data)
+		if err := json.Unmarshal(msg.Data, &parsed); err == nil {
+			content := parsed.Text
+			if content == "" {
+				content = parsed.Content
+			}
+			if content == "" {
+				content = parsed.Message
+			}
+
+			if content != "" {
+				if parsed.Type == "transcription" {
+					if d.onMessage != nil {
+						d.onMessage("me (transcription)", content, msg.Data)
+					}
+					return
+				} else if parsed.Type == "agent" || parsed.Type == "agent_response" || parsed.Role == "agent" || parsed.Role == "assistant" {
+					if d.onMessage != nil {
+						d.onMessage(fmt.Sprintf("%s (agent)", peerName), content, msg.Data)
+					}
+					return
 				}
-				return
-			} else if parsed.Type == "agent" {
-				if d.onMessage != nil {
-					d.onMessage(fmt.Sprintf("%s (agent)", peerName), parsed.Text, msg.Data)
-				}
-				return
 			}
 		}
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -15,9 +16,11 @@ import (
 	"github.com/Basistiy/glosos-client-pion/internal/audio"
 	"github.com/Basistiy/glosos-client-pion/internal/auth"
 	"github.com/Basistiy/glosos-client-pion/internal/config"
+	"github.com/Basistiy/glosos-client-pion/internal/display"
 	"github.com/Basistiy/glosos-client-pion/internal/signaling"
 	"github.com/Basistiy/glosos-client-pion/internal/webrtc"
 	pionwebrtc "github.com/pion/webrtc/v4"
+	"golang.org/x/term"
 )
 
 func main() {
@@ -35,6 +38,7 @@ func main() {
 		fmt.Printf("  Audio Input Mode : Synthetic 440Hz Test Tone\n")
 	}
 	fmt.Printf("  TURN Relay       : %v\n", cfg.UseTurn)
+	fmt.Printf("  Device Display   : %v (Yellow Letters)\n", cfg.EnableDisplay)
 	fmt.Printf("  Auto-Accept Calls: %v\n", cfg.AutoAccept)
 	fmt.Printf("  Auto-Connect     : %v\n", cfg.AutoConnect || cfg.CallTarget != "" || cfg.AutoConnectTarget != "")
 	if cfg.AutoConnectTarget != "" {
@@ -238,7 +242,13 @@ func main() {
 		OnConnectionState: func(state pionwebrtc.PeerConnectionState) {
 			if state == pionwebrtc.PeerConnectionStateConnected {
 				fmt.Printf("\n\033[1;32m[WebRTC Connected]\033[0m P2P Connection established with peer!\n> ")
+				if audioPipeline != nil {
+					audioPipeline.PlayConnectSound()
+				}
 			} else if state == pionwebrtc.PeerConnectionStateFailed || state == pionwebrtc.PeerConnectionStateClosed || state == pionwebrtc.PeerConnectionStateDisconnected {
+				if audioPipeline != nil {
+					audioPipeline.PlayDisconnectSound()
+				}
 				triggerAutoConnect()
 			}
 		},
@@ -249,7 +259,44 @@ func main() {
 			fmt.Printf("\n\033[1;31m[DataChannel Closed]\033[0m WebRTC session ended.\n> ")
 			triggerAutoConnect()
 		},
-		OnDataChannelMsg: webrtc.DefaultConsoleMessageFormatter,
+		OnDataChannelMsg: func(sender, text string, raw []byte) {
+			webrtc.DefaultConsoleMessageFormatter(sender, text, raw)
+
+			if cfg.EnableDisplay {
+				isAgent := strings.Contains(strings.ToLower(sender), "agent") ||
+					strings.Contains(strings.ToLower(sender), "assistant")
+
+				agentText := text
+				if len(raw) > 0 {
+					var parsed struct {
+						Type    string `json:"type"`
+						Role    string `json:"role"`
+						Text    string `json:"text"`
+						Content string `json:"content"`
+						Message string `json:"message"`
+					}
+					if err := json.Unmarshal(raw, &parsed); err == nil {
+						if parsed.Type == "agent" || parsed.Type == "agent_response" || parsed.Role == "agent" || parsed.Role == "assistant" {
+							isAgent = true
+						}
+						c := parsed.Text
+						if c == "" {
+							c = parsed.Content
+						}
+						if c == "" {
+							c = parsed.Message
+						}
+						if c != "" {
+							agentText = c
+						}
+					}
+				}
+
+				if isAgent && agentText != "" {
+					display.ShowAgentResponse(agentText)
+				}
+			}
+		},
 		OnRemoteAudioFrame: func(opusData []byte) {
 			if audioPipeline != nil {
 				audioPipeline.PushRemoteOpusFrame(opusData)
@@ -279,6 +326,9 @@ func main() {
 	signalingHandlers := signaling.Handlers{
 		OnConnected: func(socketID string) {
 			log.Printf("[Signaling] Ready to receive and initiate calls.")
+			if audioPipeline != nil {
+				audioPipeline.PlayServerReadySound()
+			}
 			triggerAutoConnect()
 		},
 		OnOnlineUsers: func(users []signaling.OnlineUser) {
@@ -384,24 +434,42 @@ func main() {
 	defer signalingClient.Close()
 
 	// 8. Handle SIGINT / SIGTERM for Graceful Exit
+	cleanupOnce := sync.Once{}
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			fmt.Println("\n[Main] Exiting Glosos client...")
+			if webrtcMgr != nil && webrtcMgr.TargetSocketID() != "" && signalingClient != nil {
+				_ = signalingClient.HangUp(webrtcMgr.TargetSocketID())
+			}
+			if audioPipeline != nil {
+				audioPipeline.Close()
+			}
+			if webrtcMgr != nil {
+				webrtcMgr.Close()
+			}
+			if signalingClient != nil {
+				signalingClient.Close()
+			}
+			if tokenMgr != nil {
+				tokenMgr.Stop()
+			}
+		})
+	}
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		fmt.Println("\n[Main] Exiting Glosos client...")
-		if webrtcMgr.TargetSocketID() != "" {
-			_ = signalingClient.HangUp(webrtcMgr.TargetSocketID())
-		}
-		if audioPipeline != nil {
-			audioPipeline.Close()
-		}
-		webrtcMgr.Close()
-		signalingClient.Close()
-		tokenMgr.Stop()
+		cleanup()
 		os.Exit(0)
 	}()
 
-	// 9. Interactive CLI REPL Loop
+	// 9. Headless / Daemon Mode or Interactive CLI REPL Loop
+	if cfg.Daemon || !term.IsTerminal(int(os.Stdin.Fd())) {
+		log.Println("[Main] Running in background / daemon mode. Waiting for termination signal...")
+		select {}
+	}
+
 	printHelp()
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Print("> ")
@@ -613,17 +681,24 @@ func main() {
 					fmt.Println("DataChannel is not open.")
 				}
 
-			case "quit", "exit":
-				fmt.Println("Exiting...")
-				if targetID := webrtcMgr.TargetSocketID(); targetID != "" {
-					_ = signalingClient.HangUp(targetID)
-				}
+			case "chime", "sound":
 				if audioPipeline != nil {
-					audioPipeline.Close()
+					audioPipeline.PlayConnectSound()
+					fmt.Println("[Audio] Played connection chime.")
+				} else {
+					fmt.Println("[Audio] Voice is disabled.")
 				}
-				webrtcMgr.Close()
-				signalingClient.Close()
-				tokenMgr.Stop()
+
+			case "display":
+				testMsg := "Agent: Display test! Hello from Glosos."
+				if len(parts) > 1 {
+					testMsg = strings.Join(parts[1:], " ")
+				}
+				display.ShowAgentResponse(testMsg)
+				fmt.Printf("[Display] Triggered display update with text: %q\n", testMsg)
+
+			case "quit", "exit":
+				cleanup()
 				return
 
 			default:
@@ -646,6 +721,8 @@ func main() {
 
 		fmt.Print("> ")
 	}
+
+	cleanup()
 }
 
 func printHelp() {
@@ -656,6 +733,8 @@ func printHelp() {
 	fmt.Println("  /mute / /unmute     - Mute or unmute microphone audio sending")
 	fmt.Println("  /deafen / /undeafen - Mute or unmute speaker audio playback")
 	fmt.Println("  /audio              - Show active voice/audio pipeline status")
+	fmt.Println("  /sound              - Play test connection chime")
+	fmt.Println("  /display [text]     - Test printing text on device display in yellow")
 	fmt.Println("  /devices            - List available audio input/output devices")
 	fmt.Println("  /hangup             - End the active connection")
 	fmt.Println("  /clear              - Send /clear reset command")
