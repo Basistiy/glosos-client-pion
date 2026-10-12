@@ -29,6 +29,10 @@ type Config struct {
 	Daemon            bool
 	EnableDisplay     bool
 	SendChatBin       string
+	PTT               bool
+	PTTButton         string
+	EnableESP32       bool
+	ESP32Port         string
 }
 
 // ParseFlags parses command-line flags and environment variables.
@@ -52,6 +56,13 @@ func ParseFlags() (*Config, error) {
 	flag.BoolVar(&cfg.Daemon, "headless", getEnvBoolDefault("GLOSOS_DAEMON", false), "Run in headless mode (alias)")
 	flag.BoolVar(&cfg.EnableDisplay, "display", getEnvBoolDefault("GLOSOS_DISPLAY", true), "Enable printing agent responses on device display")
 	flag.StringVar(&cfg.SendChatBin, "send-chat-bin", getEnvDefault("GLOSOS_SEND_CHAT_BIN", ""), "Path to send_chat binary for e-Paper display")
+
+	// ESP32 Hardware & Push-To-Talk Flags
+	flag.BoolVar(&cfg.PTT, "ptt", getEnvBoolDefault("GLOSOS_PTT", true), "Enable Push-To-Talk (records only while Rotary Wheel is pressed)")
+	flag.StringVar(&cfg.PTTButton, "ptt-button", getEnvDefault("GLOSOS_PTT_BUTTON", "wheel_click"), "Button ID triggering PTT recording (default: wheel_click / GPIO 5)")
+	flag.BoolVar(&cfg.EnableESP32, "esp32", getEnvBoolDefault("GLOSOS_ESP32", true), "Enable ESP32 hardware button monitor and display integration")
+	flag.StringVar(&cfg.ESP32Port, "esp32-port", getEnvDefault("GLOSOS_ESP32_PORT", ""), "Serial port for ESP32 (default: auto-detect)")
+	flag.StringVar(&cfg.ESP32Port, "serial-port", getEnvDefault("GLOSOS_ESP32_PORT", ""), "Serial port for ESP32 (alias)")
 
 	// Audio / Voice Flags
 	flag.BoolVar(&cfg.Voice, "voice", getEnvBoolDefault("GLOSOS_VOICE", true), "Enable full-duplex WebRTC voice transfer")

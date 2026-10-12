@@ -29,9 +29,10 @@ require (
 	github.com/pion/transport/v4 v4.1.0 // indirect
 	github.com/pion/turn/v5 v5.0.13 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
+	go.bug.st/serial v1.8.0 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/net v0.50.0 // indirect
-	golang.org/x/sys v0.41.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	gopkg.in/hraban/opus.v2 v2.0.0-20230925203106-0188a62cb302 // indirect
 	layeh.com/gopus v0.0.0-20210501142526-1ee02d434e32 // indirect

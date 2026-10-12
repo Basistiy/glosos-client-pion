@@ -183,6 +183,16 @@ func (p *Pipeline) PlayServerReadySound() {
 	p.devMgr.PushPlaybackPCM(pcm)
 }
 
+// PlayPTTStartSound plays a short, crisp audio feedback beep (988Hz B5, 60ms)
+// through the speaker when Push-To-Talk (PTT) recording button is pressed.
+func (p *Pipeline) PlayPTTStartSound() {
+	if !p.isRunning.Load() || p.devMgr == nil {
+		return
+	}
+	pcm := generateTonePCM(987.77, 60*time.Millisecond, 0.30)
+	p.devMgr.PushPlaybackPCM(pcm)
+}
+
 // PlayDisconnectSound plays a gentle descending two-tone cue (784Hz G5 -> 523Hz C5)
 // indicating that the WebRTC session ended.
 func (p *Pipeline) PlayDisconnectSound() {

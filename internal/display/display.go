@@ -67,7 +67,20 @@ var (
 	workerMu        sync.Mutex
 	isWorkerRunning bool
 	workerDone      sync.WaitGroup
+
+	directSender   DirectSenderFunc
+	directSenderMu sync.RWMutex
 )
+
+// DirectSenderFunc defines a function signature for sending display messages directly to hardware.
+type DirectSenderFunc func(role MsgRole, text string) error
+
+// SetDirectSender registers a direct hardware sender (e.g. from esp32.Client).
+func SetDirectSender(sender DirectSenderFunc) {
+	directSenderMu.Lock()
+	defer directSenderMu.Unlock()
+	directSender = sender
+}
 
 // SetEnabled enables or disables printing to the device display.
 func SetEnabled(en bool) {
@@ -264,7 +277,21 @@ func runDisplayWorker() {
 				continue
 			}
 
-			// 1. Check for ESP32 e-Paper send_chat binary
+			// 1. Check for direct serial sender (e.g. ESP32 client)
+			directSenderMu.RLock()
+			ds := directSender
+			directSenderMu.RUnlock()
+
+			if ds != nil {
+				if err := ds(task.role, task.text); err == nil {
+					log.Printf("[Display] Updated e-Paper via direct serial connection (%s message, %d chars)", task.role, len(task.text))
+					continue
+				} else {
+					log.Printf("[Display] Direct serial write failed: %v. Falling back to external binary.", err)
+				}
+			}
+
+			// 2. Check for ESP32 e-Paper send_chat binary
 			bin := findSendChat()
 			if bin != "" {
 				var cmdArg string

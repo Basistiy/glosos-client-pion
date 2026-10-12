@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/Basistiy/glosos-client-pion/internal/auth"
 	"github.com/Basistiy/glosos-client-pion/internal/config"
 	"github.com/Basistiy/glosos-client-pion/internal/display"
+	"github.com/Basistiy/glosos-client-pion/internal/esp32"
 	"github.com/Basistiy/glosos-client-pion/internal/signaling"
 	"github.com/Basistiy/glosos-client-pion/internal/webrtc"
 	pionwebrtc "github.com/pion/webrtc/v4"
@@ -39,11 +41,17 @@ func main() {
 	fmt.Printf("  Signaling Server : %s\n", cfg.ServerURL)
 	fmt.Printf("  User Login       : %s\n", cfg.Login)
 	fmt.Printf("  Voice Audio      : %v (Full-Duplex Opus 48kHz)\n", cfg.Voice)
+	if cfg.Voice && cfg.PTT {
+		fmt.Printf("  Push-To-Talk     : Enabled (Rotary Wheel GPIO 5 '%s')\n", cfg.PTTButton)
+	}
 	if cfg.AudioTestTone {
 		fmt.Printf("  Audio Input Mode : Synthetic 440Hz Test Tone\n")
 	}
 	fmt.Printf("  TURN Relay       : %v\n", cfg.UseTurn)
 	fmt.Printf("  Device Display   : %v (e-Paper / LCD)\n", cfg.EnableDisplay)
+	if cfg.EnableESP32 {
+		fmt.Printf("  ESP32 Hardware   : Enabled (Buttons & CDC Link)\n")
+	}
 	fmt.Printf("  Auto-Accept Calls: %v\n", cfg.AutoAccept)
 	fmt.Printf("  Auto-Connect     : %v\n", cfg.AutoConnect || cfg.CallTarget != "" || cfg.AutoConnectTarget != "")
 	if cfg.AutoConnectTarget != "" {
@@ -89,6 +97,7 @@ func main() {
 		signalingClient *signaling.Client
 		webrtcMgr       *webrtc.Manager
 		audioPipeline   *audio.Pipeline
+		esp32Client     *esp32.Client
 		onlineUsersMu   sync.RWMutex
 		onlineUsers     []signaling.OnlineUser
 
@@ -115,7 +124,81 @@ func main() {
 				log.Println("[Audio] Full-duplex voice pipeline started successfully.")
 			}
 			defer audioPipeline.Close()
+
+			if cfg.PTT {
+				audioPipeline.SetMuted(true)
+				log.Printf("[Audio] Push-To-Talk (PTT) active. Microphone muted. Press Rotary Wheel Center click (GPIO 5) to record.")
+			}
 		}
+	}
+
+	// 4.1. Initialize ESP32 Hardware Buttons & CDC Serial Link
+	if cfg.EnableESP32 {
+		esp32Client = esp32.NewClient(esp32.Config{
+			PortName: cfg.ESP32Port,
+		})
+
+		// Hook direct display sender to ESP32 CDC Serial
+		display.SetDirectSender(func(role display.MsgRole, text string) error {
+			if esp32Client == nil || !esp32Client.IsConnected() {
+				return errors.New("esp32 serial disconnected")
+			}
+			cmd := "/agent " + text
+			if role == display.RoleUser {
+				cmd = "/user " + text
+			}
+			return esp32Client.SendCommand(cmd)
+		})
+
+		// Register button events from ESP32 hardware
+		esp32Client.OnButton(func(evt esp32.ButtonEvent) {
+			isPTTBtn := evt.ID == cfg.PTTButton ||
+				(cfg.PTTButton == "wheel_click" && (evt.ID == "wheel_click" || evt.ID == "wheel" || evt.ID == "center"))
+
+			if isPTTBtn && cfg.PTT {
+				if evt.State == "press" {
+					if audioPipeline != nil {
+						audioPipeline.SetMuted(false)
+						audioPipeline.PlayPTTStartSound()
+						fmt.Printf("\n\033[1;32m🎙️ [PTT Recording]\033[0m Microphone active (Rotary Wheel held)...\n> ")
+					}
+				} else if evt.State == "release" {
+					if audioPipeline != nil {
+						audioPipeline.SetMuted(true)
+						fmt.Printf("\n\033[1;33m🔇 [PTT Muted]\033[0m Recording stopped (held for %d ms).\n> ", evt.DurationMs)
+					}
+				}
+			} else {
+				switch evt.ID {
+				case "boot":
+					if evt.State == "press" {
+						fmt.Printf("\n[Button] 🔘 BOOT Button (GPIO 0) pressed\n> ")
+					}
+				case "wheel_up":
+					if evt.State == "press" {
+						fmt.Printf("\n[Button] ⬆️ Rotary Wheel Up (GPIO 4)\n> ")
+					}
+				case "wheel_down":
+					if evt.State == "press" {
+						fmt.Printf("\n[Button] ⬇️ Rotary Wheel Down (GPIO 6)\n> ")
+					}
+				default:
+					if evt.State == "press" {
+						fmt.Printf("\n[Button] Button %q pressed\n> ", evt.ID)
+					}
+				}
+			}
+		})
+
+		// On disconnect, ensure microphone is safely muted if in PTT mode
+		esp32Client.OnDisconnect(func() {
+			if cfg.PTT && audioPipeline != nil {
+				audioPipeline.SetMuted(true)
+			}
+		})
+
+		esp32Client.Start()
+		defer esp32Client.Close()
 	}
 
 	// Helper to resolve peer target from input (number index, device keyword, or socketId)
@@ -453,6 +536,9 @@ func main() {
 	cleanup := func() {
 		cleanupOnce.Do(func() {
 			fmt.Println("\n[Main] Exiting Glosos client...")
+			if esp32Client != nil {
+				esp32Client.Close()
+			}
 			if webrtcMgr != nil && webrtcMgr.TargetSocketID() != "" && signalingClient != nil {
 				_ = signalingClient.HangUp(webrtcMgr.TargetSocketID())
 			}
@@ -637,17 +723,32 @@ func main() {
 					fmt.Println("\n--- Audio Pipeline Status ---")
 					micStatus := "\033[1;32mActive (Streaming)\033[0m"
 					if audioPipeline.IsMuted() {
-						micStatus = "\033[1;31mMuted\033[0m"
+						if cfg.PTT {
+							micStatus = "\033[1;33mPTT Idle (Muted - hold Rotary Center click to record)\033[0m"
+						} else {
+							micStatus = "\033[1;31mMuted\033[0m"
+						}
 					}
 					spkStatus := "\033[1;32mActive (Playing)\033[0m"
 					if audioPipeline.IsDeafened() {
 						spkStatus = "\033[1;31mDeafened\033[0m"
 					}
-					fmt.Printf("  Microphone : %s\n", micStatus)
-					fmt.Printf("  Speaker    : %s\n", spkStatus)
-					fmt.Printf("  Codec      : Opus 48,000 Hz, Mono, 20ms frames\n")
+					fmt.Printf("  Microphone  : %s\n", micStatus)
+					fmt.Printf("  Speaker     : %s\n", spkStatus)
+					fmt.Printf("  Push-To-Talk: %v\n", cfg.PTT)
+					if cfg.PTT {
+						fmt.Printf("  PTT Button  : %s (GPIO 5)\n", cfg.PTTButton)
+					}
+					if esp32Client != nil {
+						espStatus := "\033[1;31mDisconnected\033[0m"
+						if esp32Client.IsConnected() {
+							espStatus = fmt.Sprintf("\033[1;32mConnected\033[0m (%s)", esp32Client.PortName())
+						}
+						fmt.Printf("  ESP32 Link  : %s\n", espStatus)
+					}
+					fmt.Printf("  Codec       : Opus 48,000 Hz, Mono, 20ms frames\n")
 					if cfg.AudioTestTone {
-						fmt.Printf("  Mode       : Synthetic 440Hz Test Tone\n")
+						fmt.Printf("  Mode        : Synthetic 440Hz Test Tone\n")
 					}
 					fmt.Println("-----------------------------")
 				} else {
@@ -766,9 +867,9 @@ func printHelp() {
 	fmt.Println("  /users              - List active online devices/peers with numbers [1], [2]...")
 	fmt.Println("  /call <1|2|socket>  - Initiate WebRTC connection (e.g. /call 1)")
 	fmt.Println("  /autoconnect [on|off] - Toggle or configure automatic connection")
-	fmt.Println("  /mute / /unmute     - Mute or unmute microphone audio sending")
+	fmt.Println("  /mute / /unmute     - Mute or unmute microphone (or toggle PTT override)")
 	fmt.Println("  /deafen / /undeafen - Mute or unmute speaker audio playback")
-	fmt.Println("  /audio              - Show active voice/audio pipeline status")
+	fmt.Println("  /audio              - Show active voice/audio and PTT hardware status")
 	fmt.Println("  /sound              - Play test connection chime")
 	fmt.Println("  /display [user|agent] [text] - Test printing a user or agent bubble on device display")
 	fmt.Println("  /devices            - List available audio input/output devices")
