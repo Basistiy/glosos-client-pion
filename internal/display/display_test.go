@@ -108,7 +108,31 @@ func TestFormatWordPairsCyrillic(t *testing.T) {
 
 func TestLiveDisplayOnDevice(t *testing.T) {
 	ShowAgentResponse("Agent response:\nAll systems active!")
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+}
+
+func TestSanitizeChatText(t *testing.T) {
+	input := "  **Hello** *World*! \nThis is a `test` message.\r\nLine 2 #heading  "
+	expected := "Hello World! This is a test message. Line 2 heading"
+	actual := SanitizeChatText(input)
+	if actual != expected {
+		t.Errorf("SanitizeChatText mismatch:\nexpected: %q\ngot:      %q", expected, actual)
+	}
+}
+
+func TestShowUserAndAgentMessageNonBlocking(t *testing.T) {
+	start := time.Now()
+	// Rapidly dispatch multiple user and agent messages
+	for i := 0; i < 20; i++ {
+		ShowUserMessage("User message test")
+		ShowAgentMessage("Agent message response")
+	}
+	elapsed := time.Since(start)
+
+	// Since calls are non-blocking, all 40 calls should enqueue in well under 50ms
+	if elapsed > 100*time.Millisecond {
+		t.Errorf("enqueueing took too long (%v), expected non-blocking execution", elapsed)
+	}
 }
 
 

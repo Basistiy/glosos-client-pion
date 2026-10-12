@@ -28,6 +28,7 @@ type Config struct {
 	AudioTestTone     bool
 	Daemon            bool
 	EnableDisplay     bool
+	SendChatBin       string
 }
 
 // ParseFlags parses command-line flags and environment variables.
@@ -50,6 +51,7 @@ func ParseFlags() (*Config, error) {
 	flag.BoolVar(&cfg.Daemon, "daemon", getEnvBoolDefault("GLOSOS_DAEMON", false), "Run in daemon/background mode (no interactive prompt)")
 	flag.BoolVar(&cfg.Daemon, "headless", getEnvBoolDefault("GLOSOS_DAEMON", false), "Run in headless mode (alias)")
 	flag.BoolVar(&cfg.EnableDisplay, "display", getEnvBoolDefault("GLOSOS_DISPLAY", true), "Enable printing agent responses on device display")
+	flag.StringVar(&cfg.SendChatBin, "send-chat-bin", getEnvDefault("GLOSOS_SEND_CHAT_BIN", ""), "Path to send_chat binary for e-Paper display")
 
 	// Audio / Voice Flags
 	flag.BoolVar(&cfg.Voice, "voice", getEnvBoolDefault("GLOSOS_VOICE", true), "Enable full-duplex WebRTC voice transfer")

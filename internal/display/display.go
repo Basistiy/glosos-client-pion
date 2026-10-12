@@ -21,6 +21,30 @@ const (
 	MaxRunesForBigFont = 8 // Font size 2 is 16px wide: 128 / 16 = 8 characters max width
 )
 
+// MsgRole represents the origin of the message bubble.
+type MsgRole int
+
+const (
+	RoleUser MsgRole = iota
+	RoleAgent
+)
+
+func (r MsgRole) String() string {
+	switch r {
+	case RoleUser:
+		return "user"
+	case RoleAgent:
+		return "agent"
+	default:
+		return "unknown"
+	}
+}
+
+type displayTask struct {
+	role MsgRole
+	text string
+}
+
 // WordPair represents a single display screen showing 1 or 2 words centered, one under the other.
 type WordPair struct {
 	Text string
@@ -28,11 +52,21 @@ type WordPair struct {
 }
 
 var (
-	displayMu    sync.Mutex
-	activeCancel context.CancelFunc
-	enabled      = true
-	cachedBin    string
-	binSearched  bool
+	displayMu        sync.Mutex
+	enabled          = true
+	configuredBin    string
+	cfgBinMu         sync.Mutex
+	sendChatBin      string
+	sendChatSearched bool
+	cachedLcdBin     string
+	lcdBinSearched   bool
+
+	taskChan        = make(chan displayTask, 64)
+	workerOnce      sync.Once
+	stopChan        = make(chan struct{})
+	workerMu        sync.Mutex
+	isWorkerRunning bool
+	workerDone      sync.WaitGroup
 )
 
 // SetEnabled enables or disables printing to the device display.
@@ -49,12 +83,76 @@ func IsEnabled() bool {
 	return enabled
 }
 
-// findLcdCtl locates the lcd_ctl binary on the system.
-func findLcdCtl() string {
-	if binSearched {
-		return cachedBin
+// SetSendChatBin overrides the path to the send_chat binary for e-Paper control.
+func SetSendChatBin(path string) {
+	cfgBinMu.Lock()
+	defer cfgBinMu.Unlock()
+	configuredBin = strings.TrimSpace(path)
+	sendChatSearched = false
+}
+
+// findSendChat locates the send_chat binary on OpenStick Linux.
+func findSendChat() string {
+	cfgBinMu.Lock()
+	defer cfgBinMu.Unlock()
+
+	if sendChatSearched {
+		return sendChatBin
 	}
-	binSearched = true
+	sendChatSearched = true
+
+	// 1. Explicitly configured via CLI flag
+	if configuredBin != "" {
+		if fi, err := os.Stat(configuredBin); err == nil && !fi.IsDir() {
+			sendChatBin = configuredBin
+			return sendChatBin
+		}
+		if lp, err := exec.LookPath(configuredBin); err == nil {
+			sendChatBin = lp
+			return sendChatBin
+		}
+	}
+
+	// 2. Configured via environment variable
+	if envBin := os.Getenv("GLOSOS_SEND_CHAT_BIN"); envBin != "" {
+		if fi, err := os.Stat(envBin); err == nil && !fi.IsDir() {
+			sendChatBin = envBin
+			return sendChatBin
+		}
+		if lp, err := exec.LookPath(envBin); err == nil {
+			sendChatBin = lp
+			return sendChatBin
+		}
+	}
+
+	// 3. Standard OpenStick Linux locations
+	candidates := []string{
+		"/usr/local/bin/send_chat",
+		"/usr/bin/send_chat",
+	}
+
+	for _, c := range candidates {
+		if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
+			sendChatBin = c
+			return sendChatBin
+		}
+	}
+
+	// 4. In system PATH
+	if lp, err := exec.LookPath("send_chat"); err == nil {
+		sendChatBin = lp
+		return sendChatBin
+	}
+
+	return ""
+}
+
+// findLcdCtl locates the legacy lcd_ctl binary on the system.
+func findLcdCtl() string {
+	if lcdBinSearched {
+		return cachedLcdBin
+	}
+	lcdBinSearched = true
 
 	candidates := []string{
 		"/usr/local/bin/lcd_ctl",
@@ -63,98 +161,213 @@ func findLcdCtl() string {
 
 	for _, c := range candidates {
 		if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
-			cachedBin = c
-			return cachedBin
+			cachedLcdBin = c
+			return cachedLcdBin
 		}
 	}
 
 	if lp, err := exec.LookPath("lcd_ctl"); err == nil {
-		cachedBin = lp
-		return cachedBin
+		cachedLcdBin = lp
+		return cachedLcdBin
 	}
 
 	return ""
 }
 
-// ShowAgentResponse formats and displays the agent response on the device LCD in yellow letters.
-// If multiple responses arrive rapidly, any existing paging is canceled and the newest response is shown.
-func ShowAgentResponse(rawText string) {
+// startWorker initializes the background FIFO display dispatcher once.
+func startWorker() {
+	workerOnce.Do(func() {
+		workerMu.Lock()
+		isWorkerRunning = true
+		workerMu.Unlock()
+		workerDone.Add(1)
+		go runDisplayWorker()
+	})
+}
+
+// enqueueTask dispatches a task to the background worker channel without blocking.
+func enqueueTask(task displayTask) {
 	if !IsEnabled() {
 		return
 	}
+	startWorker()
 
-	text := strings.TrimSpace(rawText)
-	if text == "" {
+	workerMu.Lock()
+	running := isWorkerRunning
+	workerMu.Unlock()
+	if !running {
 		return
 	}
 
-	displayMu.Lock()
-	// Cancel any active paging loop from previous agent message
-	if activeCancel != nil {
-		activeCancel()
+	select {
+	case taskChan <- task:
+	default:
+		// Channel buffer is full: drop the oldest task to prioritize newer conversation
+		select {
+		case <-taskChan:
+		default:
+		}
+		taskChan <- task
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	activeCancel = cancel
-	displayMu.Unlock()
-
-	go renderAgentResponseRoutine(ctx, text)
 }
 
-func renderAgentResponseRoutine(ctx context.Context, text string) {
-	binPath := findLcdCtl()
-	if binPath == "" {
-		// Not running on an OpenStick/MF800 device or lcd_ctl not installed
+// ShowUserMessage formats and asynchronously queues a User message bubble on the e-Paper display.
+func ShowUserMessage(rawText string) {
+	clean := SanitizeChatText(rawText)
+	if clean == "" {
 		return
 	}
+	enqueueTask(displayTask{role: RoleUser, text: clean})
+}
 
+// ShowAgentMessage formats and asynchronously queues an Agent message bubble on the e-Paper display.
+func ShowAgentMessage(rawText string) {
+	clean := SanitizeChatText(rawText)
+	if clean == "" {
+		return
+	}
+	enqueueTask(displayTask{role: RoleAgent, text: clean})
+}
+
+// ShowAgentResponse is an alias for ShowAgentMessage for backwards compatibility.
+func ShowAgentResponse(rawText string) {
+	ShowAgentMessage(rawText)
+}
+
+// Close gracefully terminates the display background worker.
+func Close() {
+	workerMu.Lock()
+	if isWorkerRunning {
+		close(stopChan)
+		isWorkerRunning = false
+	}
+	workerMu.Unlock()
+	workerDone.Wait()
+}
+
+// runDisplayWorker processes display tasks sequentially to avoid overlapping USB transactions.
+func runDisplayWorker() {
+	defer workerDone.Done()
+
+	var notFoundLogged bool
+
+	for {
+		select {
+		case <-stopChan:
+			return
+		case task, ok := <-taskChan:
+			if !ok {
+				return
+			}
+
+			if !IsEnabled() {
+				continue
+			}
+
+			// 1. Check for ESP32 e-Paper send_chat binary
+			bin := findSendChat()
+			if bin != "" {
+				var cmdArg string
+				if task.role == RoleUser {
+					cmdArg = "/user " + task.text
+				} else {
+					cmdArg = "/agent " + task.text
+				}
+
+				if err := executeSendChat(bin, cmdArg); err != nil {
+					log.Printf("[Display] Failed to send chat message to e-Paper: %v", err)
+				} else {
+					log.Printf("[Display] Updated e-Paper with %s message (%d chars)", task.role, len(task.text))
+				}
+				continue
+			}
+
+			// 2. Fallback to legacy LCD if send_chat is absent
+			lcdBin := findLcdCtl()
+			if lcdBin != "" {
+				if task.role == RoleAgent {
+					renderLegacyLcdAgentResponse(lcdBin, task.text)
+				}
+				continue
+			}
+
+			if !notFoundLogged {
+				log.Println("[Display] Notice: Neither send_chat nor lcd_ctl found on system. Display updates will be skipped.")
+				notFoundLogged = true
+			}
+		}
+	}
+}
+
+// executeSendChat invokes the send_chat command on OpenStick Linux with a timeout.
+func executeSendChat(binPath, cmdArg string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var cmd *exec.Cmd
+	if os.Geteuid() == 0 {
+		cmd = exec.CommandContext(ctx, binPath, cmdArg)
+	} else {
+		cmd = exec.CommandContext(ctx, binPath, cmdArg)
+	}
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// Try with sudo -n if direct execution failed with permissions
+		if os.Geteuid() != 0 {
+			sudoCmd := exec.CommandContext(ctx, "sudo", "-n", binPath, cmdArg)
+			if sudoOut, sudoErr := sudoCmd.CombinedOutput(); sudoErr == nil {
+				return nil
+			} else {
+				return fmt.Errorf("%w (output: %s)", sudoErr, strings.TrimSpace(string(sudoOut)))
+			}
+		}
+		return fmt.Errorf("%w (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// SanitizeChatText strips markdown artifacts and normalizes newlines and whitespace for single-line CDC transmission.
+func SanitizeChatText(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", " ")
+	text = strings.ReplaceAll(text, "\r", " ")
+	text = strings.ReplaceAll(text, "\n", " ")
+	text = strings.ReplaceAll(text, "\\n", " ")
+
+	// Strip common markdown characters
+	text = strings.ReplaceAll(text, "**", "")
+	text = strings.ReplaceAll(text, "*", "")
+	text = strings.ReplaceAll(text, "`", "")
+	text = strings.ReplaceAll(text, "#", "")
+
+	fields := strings.Fields(text)
+	return strings.Join(fields, " ")
+}
+
+// renderLegacyLcdAgentResponse handles legacy ST7735 LCD yellow-letter rendering.
+func renderLegacyLcdAgentResponse(binPath, text string) {
 	pairs := FormatWordPairs(text)
 	if len(pairs) == 0 {
 		return
 	}
 
 	for idx, pair := range pairs {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
 		if err := executeLcdText(binPath, pair.Text, pair.Size); err != nil {
-			log.Printf("[Display] Failed to update display: %v", err)
+			log.Printf("[Display] Failed to update LCD display: %v", err)
 			return
 		}
 
-		log.Printf("[Display] Printed agent response on LCD (pair %d/%d, size %d)", idx+1, len(pairs), pair.Size)
-
-		// Dwell before showing next pair (or before showing loading logo after the last pair)
 		dwell := WordPairDwellTime
 		if idx == len(pairs)-1 {
 			dwell = FinalPairDwellTime
 		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(dwell):
-		}
+		time.Sleep(dwell)
 	}
 
-	// Show glosos loading logo after all text has been displayed
-	select {
-	case <-ctx.Done():
-		return
-	default:
-	}
-
-	if err := showGlososLogo(binPath); err != nil {
-		log.Printf("[Display] Failed to restore glosos logo: %v", err)
-	} else {
-		log.Printf("[Display] Restored glosos loading logo on LCD")
-	}
+	_ = showGlososLogo(binPath)
 }
 
-// showGlososLogo displays the Glosos waveform logo on the screen.
+// showGlososLogo displays the Glosos waveform logo on the legacy LCD.
 func showGlososLogo(binPath string) error {
 	var cmd *exec.Cmd
 	if os.Geteuid() == 0 {
@@ -179,7 +392,6 @@ func executeLcdText(binPath, pageText string, size int) error {
 	sizeStr := strconv.Itoa(size)
 	args := []string{"text", "-color", "yellow", "-bg", "black", "-center", "-size", sizeStr, "-no-init", "-no-screenshot", pageText}
 
-	// Try without sudo if running as root, otherwise try with sudo -n
 	var cmd *exec.Cmd
 	if os.Geteuid() == 0 {
 		cmd = exec.Command(binPath, args...)
@@ -189,7 +401,6 @@ func executeLcdText(binPath, pageText string, size int) error {
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		// Fallback to direct invocation if sudo -n fails
 		fallbackCmd := exec.Command(binPath, args...)
 		if _, fallbackErr := fallbackCmd.CombinedOutput(); fallbackErr == nil {
 			return nil
@@ -202,11 +413,9 @@ func executeLcdText(binPath, pageText string, size int) error {
 // FormatWordPairs breaks text into 2-word pairs (one under the other), choosing size 2 (big font)
 // if both words fit within the 128px screen width (<= 8 runes), or size 1 for longer words.
 func FormatWordPairs(text string) []WordPair {
-	// Normalize line breaks
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\\n", "\n")
 
-	// Strip markdown artifacts
 	text = strings.ReplaceAll(text, "**", "")
 	text = strings.ReplaceAll(text, "*", "")
 	text = strings.ReplaceAll(text, "`", "")
@@ -251,7 +460,6 @@ func FormatWordPairs(text string) []WordPair {
 
 // formatTextPages wraps text into lines of at most maxCharsPerLine and chunks into pages of maxLinesPerPage.
 func formatTextPages(text string, maxCharsPerLine, maxLinesPerPage int) []string {
-	// Normalize literal \n or CRLF
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\\n", "\n")
 
@@ -278,7 +486,6 @@ func formatTextPages(text string, maxCharsPerLine, maxLinesPerPage int) []string
 						currentLine = string(runes)
 						break
 					} else {
-						// Word is longer than an entire line; slice it
 						wrappedLines = append(wrappedLines, string(runes[:maxCharsPerLine]))
 						runes = runes[maxCharsPerLine:]
 					}

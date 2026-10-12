@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -97,6 +98,39 @@ func (d *DeviceManager) ListDevices() ([]DeviceInfo, error) {
 	return results, nil
 }
 
+// findDevice searches for an audio device matching preferredName or auto-detects ESP32/Display/UAC devices.
+func (d *DeviceManager) findDevice(devType malgo.DeviceType, preferredName string) (*malgo.DeviceInfo, error) {
+	if d.ctx == nil {
+		return nil, errors.New("audio context not initialized")
+	}
+	devs, err := d.ctx.Devices(devType)
+	if err != nil {
+		return nil, err
+	}
+
+	lowerPref := strings.ToLower(strings.TrimSpace(preferredName))
+	if lowerPref != "" {
+		for _, dev := range devs {
+			name := strings.ToLower(dev.Name())
+			if strings.Contains(name, lowerPref) || dev.ID.String() == preferredName {
+				devCopy := dev
+				return &devCopy, nil
+			}
+		}
+	}
+
+	// Auto-detect Display / ESP32 / UAC audio device
+	for _, dev := range devs {
+		name := strings.ToLower(dev.Name())
+		if strings.Contains(name, "display") || strings.Contains(name, "esp") || strings.Contains(name, "uac") {
+			devCopy := dev
+			return &devCopy, nil
+		}
+	}
+
+	return nil, nil
+}
+
 // StartCapture begins capturing PCM audio from the microphone (or test tone).
 func (d *DeviceManager) StartCapture(onPCM func([]int16)) error {
 	if d.isCapturing.Swap(true) {
@@ -116,6 +150,11 @@ func (d *DeviceManager) StartCapture(onPCM func([]int16)) error {
 	deviceConfig.Capture.Channels = Channels
 	deviceConfig.SampleRate = SampleRate
 	deviceConfig.Alsa.NoMMap = 1
+
+	if dev, _ := d.findDevice(malgo.Capture, d.inputDeviceName); dev != nil {
+		deviceConfig.Capture.DeviceID = dev.ID.Pointer()
+		log.Printf("[Audio] Selected microphone device: %s", dev.Name())
+	}
 
 	var pcmAccumulator []int16
 	var accMu sync.Mutex
@@ -181,6 +220,11 @@ func (d *DeviceManager) StartPlayback() error {
 	deviceConfig.Playback.Channels = Channels
 	deviceConfig.SampleRate = SampleRate
 	deviceConfig.Alsa.NoMMap = 1
+
+	if dev, _ := d.findDevice(malgo.Playback, d.outputDeviceName); dev != nil {
+		deviceConfig.Playback.DeviceID = dev.ID.Pointer()
+		log.Printf("[Audio] Selected speaker device: %s", dev.Name())
+	}
 
 	onSendFrames := func(pOutputSample, pInputSample []byte, framecount uint32) {
 		samplesNeeded := int(framecount) * Channels

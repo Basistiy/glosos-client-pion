@@ -29,6 +29,11 @@ func main() {
 		log.Fatalf("[Main] Configuration error: %v", err)
 	}
 
+	display.SetEnabled(cfg.EnableDisplay)
+	if cfg.SendChatBin != "" {
+		display.SetSendChatBin(cfg.SendChatBin)
+	}
+
 	fmt.Println("======================================================")
 	fmt.Println("  Glosos Pion WebRTC Headless Client")
 	fmt.Printf("  Signaling Server : %s\n", cfg.ServerURL)
@@ -38,7 +43,7 @@ func main() {
 		fmt.Printf("  Audio Input Mode : Synthetic 440Hz Test Tone\n")
 	}
 	fmt.Printf("  TURN Relay       : %v\n", cfg.UseTurn)
-	fmt.Printf("  Device Display   : %v (Yellow Letters)\n", cfg.EnableDisplay)
+	fmt.Printf("  Device Display   : %v (e-Paper / LCD)\n", cfg.EnableDisplay)
 	fmt.Printf("  Auto-Accept Calls: %v\n", cfg.AutoAccept)
 	fmt.Printf("  Auto-Connect     : %v\n", cfg.AutoConnect || cfg.CallTarget != "" || cfg.AutoConnectTarget != "")
 	if cfg.AutoConnectTarget != "" {
@@ -265,8 +270,10 @@ func main() {
 			if cfg.EnableDisplay {
 				isAgent := strings.Contains(strings.ToLower(sender), "agent") ||
 					strings.Contains(strings.ToLower(sender), "assistant")
+				isUser := strings.HasPrefix(strings.ToLower(sender), "me") ||
+					strings.Contains(strings.ToLower(sender), "transcription")
 
-				agentText := text
+				msgText := text
 				if len(raw) > 0 {
 					var parsed struct {
 						Type    string `json:"type"`
@@ -278,6 +285,10 @@ func main() {
 					if err := json.Unmarshal(raw, &parsed); err == nil {
 						if parsed.Type == "agent" || parsed.Type == "agent_response" || parsed.Role == "agent" || parsed.Role == "assistant" {
 							isAgent = true
+							isUser = false
+						} else if parsed.Type == "transcription" || parsed.Type == "user" || parsed.Role == "user" {
+							isUser = true
+							isAgent = false
 						}
 						c := parsed.Text
 						if c == "" {
@@ -287,13 +298,17 @@ func main() {
 							c = parsed.Message
 						}
 						if c != "" {
-							agentText = c
+							msgText = c
 						}
 					}
 				}
 
-				if isAgent && agentText != "" {
-					display.ShowAgentResponse(agentText)
+				if msgText != "" {
+					if isAgent {
+						display.ShowAgentMessage(msgText)
+					} else if isUser {
+						display.ShowUserMessage(msgText)
+					}
 				}
 			}
 		},
@@ -441,6 +456,7 @@ func main() {
 			if webrtcMgr != nil && webrtcMgr.TargetSocketID() != "" && signalingClient != nil {
 				_ = signalingClient.HangUp(webrtcMgr.TargetSocketID())
 			}
+			display.Close()
 			if audioPipeline != nil {
 				audioPipeline.Close()
 			}
@@ -690,12 +706,29 @@ func main() {
 				}
 
 			case "display":
-				testMsg := "Agent: Display test! Hello from Glosos."
+				testMsg := "Display test from Glosos!"
+				isUser := false
 				if len(parts) > 1 {
-					testMsg = strings.Join(parts[1:], " ")
+					if strings.ToLower(parts[1]) == "user" {
+						isUser = true
+						if len(parts) > 2 {
+							testMsg = strings.Join(parts[2:], " ")
+						}
+					} else if strings.ToLower(parts[1]) == "agent" {
+						if len(parts) > 2 {
+							testMsg = strings.Join(parts[2:], " ")
+						}
+					} else {
+						testMsg = strings.Join(parts[1:], " ")
+					}
 				}
-				display.ShowAgentResponse(testMsg)
-				fmt.Printf("[Display] Triggered display update with text: %q\n", testMsg)
+				if isUser {
+					display.ShowUserMessage(testMsg)
+					fmt.Printf("[Display] Triggered user bubble with text: %q\n", testMsg)
+				} else {
+					display.ShowAgentResponse(testMsg)
+					fmt.Printf("[Display] Triggered agent bubble with text: %q\n", testMsg)
+				}
 
 			case "quit", "exit":
 				cleanup()
@@ -713,6 +746,9 @@ func main() {
 				} else {
 					// Echo message locally
 					fmt.Printf("[me] %s\n", rawLine)
+					if cfg.EnableDisplay {
+						display.ShowUserMessage(rawLine)
+					}
 				}
 			} else {
 				fmt.Println("\033[1;33m[Warning]\033[0m DataChannel is not open. Connect to a peer first with /call <number|socketId> or click Connect in the Web client.")
@@ -734,7 +770,7 @@ func printHelp() {
 	fmt.Println("  /deafen / /undeafen - Mute or unmute speaker audio playback")
 	fmt.Println("  /audio              - Show active voice/audio pipeline status")
 	fmt.Println("  /sound              - Play test connection chime")
-	fmt.Println("  /display [text]     - Test printing text on device display in yellow")
+	fmt.Println("  /display [user|agent] [text] - Test printing a user or agent bubble on device display")
 	fmt.Println("  /devices            - List available audio input/output devices")
 	fmt.Println("  /hangup             - End the active connection")
 	fmt.Println("  /clear              - Send /clear reset command")
